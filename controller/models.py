@@ -1,7 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class ProposalStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    APPLIED = "applied"
+    LAPSED = "lapsed"
+    EXPIRED = "expired"
+    STALE = "stale"
+
+
+@dataclass
+class ProposalIntent:
+    workflow_id: str
+    proposed_config: dict[str, Any]
+    rationale: str
+    changed_dims: list[str] = field(default_factory=list)
+    evidence: dict[str, Any] | None = None
+    change_summary: str = ""
+    impact_score: float = 0.5
+    created_minute: int = 0
 
 
 @dataclass
@@ -37,7 +60,7 @@ class ProposalRecord:
     proposal_id: str
     workflow_id: str
     base_version: int
-    status: str  # pending | approved | rejected | applied | lapsed | expired
+    status: str  # pending | approved | rejected | applied | lapsed | expired | stale
     change_summary: str
     proposed_config: dict[str, Any]
     diff: dict[str, Any]

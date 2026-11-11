@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .db import Database
-from .models import AuditEntry
+from .models import AuditEntry, ProposalIntent, ProposalRecord
 
 
 @dataclass
@@ -30,7 +30,7 @@ class WorkflowRuntimeState:
         self.current_config = initial_config.get("config", {})
         self.actor = initial_config.get("actor", "business_default")
 
-        # Rolling window of recent calls for incident detection (e.g., last 300 calls)
+        # Rolling window of recent calls for incident detection (last 500 calls)
         self.recent_calls: deque[CallOutcome] = deque(maxlen=500)
 
         # Totals
@@ -41,6 +41,12 @@ class WorkflowRuntimeState:
 
         # Per DID stats: did -> [dials, connected]
         self.did_stats: dict[str, list[int]] = {}
+
+        # Pending proposals in flight: approval_id -> ProposalRecord
+        self.pending_approvals: dict[str, ProposalRecord] = {}
+
+        # Queued proposal intents waiting for approver working hours or rate limit quota
+        self.queued_intents: list[ProposalIntent] = []
 
     def record_call(self, ev: dict[str, Any], sim_minute: int):
         self.total_dials += 1
@@ -84,7 +90,6 @@ class WorkflowRuntimeState:
         engage_rate = (self.total_engaged / self.total_connected) if self.total_connected > 0 else 0.0
         halluc_rate = (self.total_hallucinations / self.total_connected) if self.total_connected > 0 else 0.0
 
-        # Rolling window rates
         recent_dials = len(self.recent_calls)
         recent_conn = sum(1 for c in self.recent_calls if c.connected)
         recent_eng = sum(1 for c in self.recent_calls if c.engaged)
@@ -139,6 +144,14 @@ class StateManager:
                 wf.current_version = new_v
                 wf.actor = actor
 
+                # If changed by supervisor or external, any pending proposal with old base_version becomes stale
+                for aid, prop in list(wf.pending_approvals.items()):
+                    if prop.base_version != new_v:
+                        prop.status = "stale"
+                        prop.reasons.append(f"Supervisor updated config to version {new_v}")
+                        self.db.upsert_proposal(prop)
+                        wf.pending_approvals.pop(aid, None)
+
                 # Record in audit log
                 self.db.record_audit(
                     AuditEntry(
@@ -161,11 +174,12 @@ class StateManager:
             aid = ev.get("approval_id")
             status = ev.get("status")
             reasons = ev.get("reasons", [])
-            # Update proposal if present in DB
-            props = self.db.list_proposals(workflow_id=wid)
-            for p in props:
-                if p.approval_id == aid:
-                    p.status = str(status)
-                    p.reasons = reasons
-                    self.db.upsert_proposal(p)
-                    break
+            if wid and wid in self.workflows:
+                wf = self.workflows[wid]
+                if aid in wf.pending_approvals:
+                    prop = wf.pending_approvals[aid]
+                    prop.status = status
+                    prop.reasons = reasons
+                    self.db.upsert_proposal(prop)
+                    if status in ("rejected", "expired", "lapsed"):
+                        wf.pending_approvals.pop(aid, None)
