@@ -6,7 +6,9 @@ from typing import Any
 
 from .client import BaseClient
 from .db import Database
+from .detector import DidHealthDetector, HallucinationDetector
 from .governance import GovernanceEngine, compute_changed_dims, compute_json_diff
+from .incident import IncidentManager
 from .models import AuditEntry, Checkpoint, ProposalIntent, ProposalRecord
 from .state import StateManager
 
@@ -25,6 +27,15 @@ class ControllerLoop:
         self.last_event_id = -1
         self.is_running = True
 
+        # Incident detectors and manager
+        self.hallucination_detector = HallucinationDetector(
+            threshold=0.048, min_sample=50
+        )
+        self.did_detector = DidHealthDetector(
+            min_calls_per_did=40, drop_ratio_threshold=0.55
+        )
+        self.incident_mgr = IncidentManager(client)
+
     def setup(self):
         """Initialize workflows and recover state from checkpoints or history."""
         wfs = self.client.get_workflows()
@@ -40,7 +51,9 @@ class ControllerLoop:
             self.last_event_id = cp.last_event_id
             self.sim_minute = cp.sim_minute
             self.sim_ts = cp.sim_ts
-            logger.info(f"Resumed from checkpoint: chunk={self.last_chunk_id}, event={self.last_event_id}, minute={self.sim_minute}")
+            logger.info(
+                f"Resumed from checkpoint: chunk={self.last_chunk_id}, event={self.last_event_id}, minute={self.sim_minute}"
+            )
 
             pending_props = self.db.list_proposals(status="pending")
             for p in pending_props:
@@ -76,6 +89,51 @@ class ControllerLoop:
         )
         self.db.save_checkpoint(cp)
 
+    def run_incident_checks(self):
+        """Continuously check rolling metrics for hallucination spikes or degraded caller IDs."""
+        for wid, wf in self.state_mgr.workflows.items():
+            metrics = wf.get_metrics_snapshot()
+            recent_calls_list = list(wf.recent_calls)
+
+            # 1. Check for hallucination spike
+            is_halluc_incident, rate, sample_size = self.hallucination_detector.check(
+                recent_calls_list
+            )
+            if is_halluc_incident:
+                logger.warning(
+                    f"[{self.sim_ts}] Hallucination spike detected on {wid}: rate={rate:.4f} over {sample_size} calls"
+                )
+                remediation_intent = self.incident_mgr.handle_hallucination_incident(
+                    wid=wid,
+                    spec=wf.spec,
+                    current_cfg=wf.current_config,
+                    sim_minute=self.sim_minute,
+                    rate=rate,
+                    last_safe_prompt=wf.last_safe_prompt,
+                )
+                if remediation_intent:
+                    wf.queued_intents.append(remediation_intent)
+            else:
+                current_p = wf.current_config.get("prompt_version", "")
+                self.incident_mgr.verify_incidents(
+                    wid, metrics["window_hallucination_rate"], current_p
+                )
+
+            # 2. Check for caller ID (DID) degradation using rolling recent calls
+            degraded_dids = self.did_detector.check_recent(recent_calls_list)
+            if degraded_dids:
+                logger.warning(
+                    f"[{self.sim_ts}] Degraded DIDs detected on {wid}: {degraded_dids}"
+                )
+                did_remediation = self.incident_mgr.handle_did_degradation(
+                    wid=wid,
+                    current_cfg=wf.current_config,
+                    degraded_dids=degraded_dids,
+                    sim_minute=self.sim_minute,
+                )
+                if did_remediation:
+                    wf.queued_intents.append(did_remediation)
+
     def reconcile_approvals(self):
         """Check status of pending approvals, apply approved ones, handle expiration/rejection."""
         for wid, wf in self.state_mgr.workflows.items():
@@ -97,7 +155,9 @@ class ControllerLoop:
                         wf.current_config = cfg_now["config"]
 
                         if prop.base_version != wf.current_version:
-                            logger.warning(f"Approval {aid} stale: base {prop.base_version} != current {wf.current_version}")
+                            logger.warning(
+                                f"Approval {aid} stale: base {prop.base_version} != current {wf.current_version}"
+                            )
                             prop.status = "stale"
                             prop.reasons.append("Base version changed before apply")
                             self.db.upsert_proposal(prop)
@@ -112,7 +172,9 @@ class ControllerLoop:
                         wf.pending_approvals.pop(aid, None)
                         wf.current_version = applied_v
                         wf.current_config = prop.proposed_config
-                        logger.info(f"[{self.sim_ts}] Applied approval {aid} for {wid} -> v{applied_v}")
+                        logger.info(
+                            f"[{self.sim_ts}] Applied approval {aid} for {wid} -> v{applied_v}"
+                        )
                     except Exception as e:
                         logger.error(f"Failed to apply approval {aid}: {e}")
                         if "stale_base_version" in str(e):
@@ -123,7 +185,9 @@ class ControllerLoop:
                         wf.pending_approvals.pop(aid, None)
 
                 elif status in ("rejected", "expired", "lapsed"):
-                    logger.info(f"[{self.sim_ts}] Approval {aid} concluded with status '{status}': {prop.reasons}")
+                    logger.info(
+                        f"[{self.sim_ts}] Approval {aid} concluded with status '{status}': {prop.reasons}"
+                    )
                     self.db.upsert_proposal(prop)
                     wf.pending_approvals.pop(aid, None)
 
@@ -142,7 +206,7 @@ class ControllerLoop:
             except Exception as e:
                 logger.warning(f"Could not refresh config for {wid}: {e}")
 
-            # 1. Process auto-apply intents immediately (they don't fatigue human approvers)
+            # 1. Process auto-apply intents immediately (e.g. caller ID shifts)
             remaining_intents = []
             for intent in wf.queued_intents:
                 can_auto, auto_reason, changed_dims = GovernanceEngine.can_auto_apply(
@@ -165,13 +229,16 @@ class ControllerLoop:
                         wf.current_version = applied_v
                         wf.current_config = intent.proposed_config
 
-                        diff = compute_json_diff(wf.current_config, intent.proposed_config)
+                        diff = compute_json_diff(
+                            wf.current_config, intent.proposed_config
+                        )
                         prop_rec = ProposalRecord(
                             proposal_id=pid,
                             workflow_id=wid,
                             base_version=wf.current_version - 1,
                             status="applied",
-                            change_summary=intent.change_summary or f"Auto-apply {', '.join(changed_dims)}",
+                            change_summary=intent.change_summary
+                            or f"Auto-apply {', '.join(changed_dims)}",
                             proposed_config=intent.proposed_config,
                             diff=diff,
                             affected_leads=0,
@@ -181,9 +248,13 @@ class ControllerLoop:
                             created_minute=self.sim_minute,
                         )
                         self.db.upsert_proposal(prop_rec)
-                        logger.info(f"[{self.sim_ts}] Auto-applied config for {wid} -> v{applied_v} ({changed_dims})")
+                        logger.info(
+                            f"[{self.sim_ts}] Auto-applied config for {wid} -> v{applied_v} ({changed_dims})"
+                        )
                     except Exception as e:
-                        logger.error(f"Auto-apply failed for {wid}: {e}. Retaining for approval.")
+                        logger.error(
+                            f"Auto-apply failed for {wid}: {e}. Retaining for approval."
+                        )
                         remaining_intents.append(intent)
                 else:
                     remaining_intents.append(intent)
@@ -192,18 +263,33 @@ class ControllerLoop:
             if not wf.queued_intents:
                 continue
 
-            # 2. For human approvals: check dynamic dispatch window and fatigue quota
-            is_emergency = any(intent.evidence is not None for intent in wf.queued_intents)
-            if not GovernanceEngine.is_dispatch_time(wf.spec, self.sim_minute, self.tick_step_minutes, is_emergency=is_emergency):
-                logger.debug(f"[{self.sim_ts}] Holding {len(wf.queued_intents)} intents for {wid} until scheduled dispatch slot.")
+            # 2. Check if any intent is an emergency (e.g. prompt fix with validation evidence)
+            is_emergency = any(
+                intent.evidence is not None for intent in wf.queued_intents
+            )
+            if not GovernanceEngine.is_dispatch_time(
+                wf.spec,
+                self.sim_minute,
+                self.tick_step_minutes,
+                is_emergency=is_emergency,
+            ):
+                logger.debug(
+                    f"[{self.sim_ts}] Holding {len(wf.queued_intents)} intents for {wid} until scheduled dispatch slot."
+                )
                 continue
 
-            if not GovernanceEngine.is_quota_available(wid, wf.spec, all_proposals, self.sim_minute):
-                logger.info(f"[{self.sim_ts}] Approver 24h quota reached for {wid}. Holding bundled changes in queue.")
+            if not GovernanceEngine.is_quota_available(
+                wid, wf.spec, all_proposals, self.sim_minute
+            ):
+                logger.info(
+                    f"[{self.sim_ts}] Approver 24h quota reached for {wid}. Holding bundled changes in queue."
+                )
                 continue
 
             # 3. Bundle all pending intents into a single atomic proposal payload
-            bundled_intent = GovernanceEngine.bundle_intents(wf.queued_intents, wf.current_config)
+            bundled_intent = GovernanceEngine.bundle_intents(
+                wf.queued_intents, wf.current_config
+            )
             wf.queued_intents.clear()
 
             body = GovernanceEngine.package_proposal(
@@ -236,14 +322,18 @@ class ControllerLoop:
                 self.db.upsert_proposal(prop_rec)
                 if aid:
                     wf.pending_approvals[aid] = prop_rec
-                logger.info(f"[{self.sim_ts}] Dispatched bundled approval {aid} for {wid} at scheduled slot: {body['change_summary']}")
+                logger.info(
+                    f"[{self.sim_ts}] Dispatched approval {aid} for {wid}: {body['change_summary']}"
+                )
             except Exception as e:
                 logger.error(f"Failed to submit approval for {wid}: {e}")
 
     def step(self) -> bool:
-        """Advance simulation by tick_step_minutes, process events, reconcile approvals and checkpoint."""
+        """Advance simulation by tick_step_minutes, process events, detect incidents, reconcile approvals and checkpoint."""
         adv = self.client.advance(self.tick_step_minutes)
-        self.sim_minute = adv.get("sim_minute", self.sim_minute + self.tick_step_minutes)
+        self.sim_minute = adv.get(
+            "sim_minute", self.sim_minute + self.tick_step_minutes
+        )
         self.sim_ts = adv.get("ts", self.sim_ts)
         finished = adv.get("finished", False)
 
@@ -251,8 +341,15 @@ class ControllerLoop:
         for ch in new_chunks:
             self._ingest_chunk(ch)
 
+        # 1. Run continuous incident detectors
+        self.run_incident_checks()
+
+        # 2. Reconcile existing approvals
         self.reconcile_approvals()
+
+        # 3. Process outgoing proposal queue
         self.process_queued_proposals()
+
         self.save_checkpoint()
         return not finished
 
@@ -265,7 +362,11 @@ class ControllerLoop:
             step_count += 1
             if step_count % 24 == 0:
                 elapsed = time.time() - start_wall
-                logger.info(f"[{self.sim_ts}] Day completed. Total steps: {step_count}, Wall-clock: {elapsed:.2f}s, Last Event: {self.last_event_id}")
+                logger.info(
+                    f"[{self.sim_ts}] Day completed. Total steps: {step_count}, Wall-clock: {elapsed:.2f}s, Last Event: {self.last_event_id}"
+                )
             if not more:
-                logger.info(f"Simulation finished at minute {self.sim_minute} ({self.sim_ts}).")
+                logger.info(
+                    f"Simulation finished at minute {self.sim_minute} ({self.sim_ts})."
+                )
                 break
