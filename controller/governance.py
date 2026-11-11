@@ -6,19 +6,32 @@ from typing import Any
 
 from .models import ProposalIntent, ProposalRecord
 
+# Dimensions governed by agent allocation sampling (welcome_message, voice, caller_id)
 AGENT_DIMS = ["welcome_message", "voice", "caller_id"]
+
+# All dimensions eligible for configuration modification
 CHANGE_DIMS = ["cohorts", "welcome_message", "voice", "caller_id", "prompt_version", "schedule"]
+
 MINUTES_PER_DAY = 1440
 
 
 def dist_of(cfg: dict[str, Any], cohort: str, dim: str) -> dict[str, float]:
-    """Retrieve distribution dict for a cohort and dimension."""
+    """Retrieve the probability distribution dictionary for a cohort and dimension.
+
+    If the specified cohort does not define this dimension, fall back to the 'default' cohort.
+    """
     allocs = cfg.get("allocations", {})
     return (allocs.get(cohort) or {}).get(dim) or allocs.get("default", {}).get(dim, {})
 
 
 def compute_max_shift(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> float:
-    """Calculates maximum total-variation distance across all cohorts and agent dimensions."""
+    """Calculates the maximum Total Variation (TV) distance across all cohorts and agent dimensions.
+
+    Total Variation Distance between two discrete distributions P and Q is defined as:
+        TV(P, Q) = 0.5 * sum(|P(x) - Q(x)|)
+
+    This is the exact metric used by the platform governance policy (governance.auto_apply.max_shift).
+    """
     cohorts_old = {c["id"] for c in old_cfg.get("cohorts", [])}
     cohorts_new = {c["id"] for c in new_cfg.get("cohorts", [])}
     all_cohorts = {"default"} | cohorts_old | cohorts_new
@@ -38,7 +51,14 @@ def compute_max_shift(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> float
 
 
 def compute_changed_dims(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> list[str]:
-    """Identify which dimensions differ between old and new configuration."""
+    """Identify which dimensions differ between the old and new configuration.
+
+    Evaluates:
+    - cohorts: list equality
+    - welcome_message, voice, caller_id: distribution equality across all defined cohorts
+    - prompt_version: string equality
+    - schedule: dictionary equality
+    """
     changed = []
     if old_cfg.get("cohorts", []) != new_cfg.get("cohorts", []):
         changed.append("cohorts")
@@ -58,7 +78,10 @@ def compute_changed_dims(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> li
 
 
 def compute_json_diff(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Build a detailed and human-readable diff dictionary."""
+    """Build a detailed and human-readable diff dictionary for the governance proposal.
+
+    The simulator requires 'diff' to be non-empty and descriptive of the exact changes.
+    """
     diff: dict[str, Any] = {}
     if old_cfg.get("prompt_version") != new_cfg.get("prompt_version"):
         diff["prompt_version"] = {
@@ -73,7 +96,7 @@ def compute_json_diff(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> dict[
             "new_cohorts": new_cfg.get("cohorts", []),
         }
 
-    # Allocation diffs
+    # Compare allocations across cohorts and agent dimensions
     all_cohorts = set(old_cfg.get("allocations", {})) | set(new_cfg.get("allocations", {}))
     for c in all_cohorts:
         for dim in AGENT_DIMS:
@@ -82,7 +105,7 @@ def compute_json_diff(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> dict[
             if d_old != d_new:
                 diff[f"allocations.{c}.{dim}"] = {"from": d_old, "to": d_new}
 
-    # Schedule diffs
+    # Compare schedule
     if old_cfg.get("schedule") != new_cfg.get("schedule"):
         diff["schedule"] = {
             "from": old_cfg.get("schedule", {}),
@@ -93,11 +116,17 @@ def compute_json_diff(old_cfg: dict[str, Any], new_cfg: dict[str, Any]) -> dict[
 
 
 class GovernanceEngine:
-    """Manages policy validation, auto-apply suitability, proposal packaging, and fatigue batching."""
+    """Manages policy validation, auto-apply suitability, dynamic window scheduling, and fatigue batching."""
 
     @staticmethod
     def can_auto_apply(spec: dict[str, Any], current_cfg: dict[str, Any], proposed_cfg: dict[str, Any]) -> tuple[bool, str, list[str]]:
-        """Determines if a configuration shift meets auto-apply policy criteria."""
+        """Determines if a configuration shift meets auto-apply policy criteria.
+
+        Checks:
+        1. auto_apply.enabled is True
+        2. All changed dimensions are in auto_apply.allowed_dims
+        3. Total Variation distance <= auto_apply.max_shift
+        """
         gov = spec.get("governance", {})
         auto_pol = gov.get("auto_apply", {})
         if not auto_pol.get("enabled", False):
@@ -120,24 +149,75 @@ class GovernanceEngine:
         return True, "eligible for auto-apply", changed
 
     @staticmethod
-    def is_approver_active(spec: dict[str, Any], sim_minute: int) -> bool:
-        """Checks if current simulation time is within the human approver's working hours (IST)."""
+    def get_dispatch_slots(spec: dict[str, Any], close_buffer_minutes: int = 30) -> list[int]:
+        """Calculates dynamic dispatch minute slots (in minutes of day, 0-1439).
+
+        Evenly spaces up to max_requests_per_24h across the active approver window,
+        leaving a close buffer before the window ends so requests don't lapse or expire.
+
+        Formula:
+            interval = ((end_hour * 60 - buffer) - (start_hour * 60)) / max_requests_per_24h
+            slot_i = start_minute + i * interval
+        """
         gov = spec.get("governance", {})
-        hours = gov.get("approver_hours", [9, 18])
-        if len(hours) != 2:
-            return True
-        start_hour, end_hour = hours
-        # Minute in current day (0 to 1439)
+        hours = gov.get("approver_hours", [10, 19])
+        start_hour, end_hour = hours[0], hours[1]
+
+        start_minute = start_hour * 60
+        end_minute = max(start_minute + 60, (end_hour * 60) - close_buffer_minutes)
+        window_duration = end_minute - start_minute
+
+        max_requests = max(1, gov.get("max_requests_per_24h", 3))
+
+        if max_requests == 1:
+            return [start_minute]
+
+        # Interval between dispatches
+        interval = window_duration / max_requests
+        slots = [int(start_minute + i * interval) for i in range(max_requests)]
+        return slots
+
+    @classmethod
+    def is_dispatch_time(cls, spec: dict[str, Any], sim_minute: int, tick_step_minutes: int = 60, is_emergency: bool = False) -> bool:
+        """Checks if the current simulation minute matches a scheduled dispatch slot.
+
+        Emergency fixes (e.g. prompt hallucinations) bypass the spacing interval and dispatch
+        as soon as human approvers are active in working hours.
+        """
+        if is_emergency:
+            # Emergency (e.g. hallucination incident fix): dispatch immediately if in active hours
+            return cls.is_approver_active(spec, sim_minute)
+
+        minute_of_day = sim_minute % MINUTES_PER_DAY
+        slots = cls.get_dispatch_slots(spec)
+
+        for slot in slots:
+            # If current minute falls within the step window [slot, slot + tick_step_minutes)
+            if slot <= minute_of_day < (slot + tick_step_minutes):
+                return True
+        return False
+
+    @staticmethod
+    def is_approver_active(spec: dict[str, Any], sim_minute: int) -> bool:
+        """Checks if current simulation time is within the human approver's working hours (IST).
+
+        E.g., for approver_hours: [10, 19], only minutes corresponding to 10:00 through 18:59 return True.
+        """
+        gov = spec.get("governance", {})
+        hours = gov.get("approver_hours", [10, 19])
+        start_hour, end_hour = hours[0], hours[1]
         day_minute = sim_minute % MINUTES_PER_DAY
         current_hour = day_minute // 60
         return start_hour <= current_hour < end_hour
 
     @staticmethod
     def is_quota_available(wid: str, spec: dict[str, Any], recent_proposals: list[ProposalRecord], sim_minute: int) -> bool:
-        """Ensures request rate doesn't exceed max_requests_per_24h (mitigates approver fatigue)."""
+        """Ensures request rate doesn't exceed max_requests_per_24h (mitigates approver fatigue).
+
+        Checks the rolling 24-hour window (1440 minutes prior to sim_minute).
+        """
         gov = spec.get("governance", {})
         max_per_day = gov.get("max_requests_per_24h", 3)
-        # Count proposals created in the last 24h (1440 minutes)
         recent_count = sum(
             1 for p in recent_proposals
             if p.workflow_id == wid and p.created_minute > (sim_minute - MINUTES_PER_DAY)
@@ -145,13 +225,64 @@ class GovernanceEngine:
         return (recent_count + 1) <= max_per_day
 
     @staticmethod
-    def estimate_affected_leads(spec: dict[str, Any], changed_dims: list[str], total_leads: int) -> int:
-        """Estimates the number of leads affected by the change."""
-        if "prompt_version" in changed_dims or "cohorts" in changed_dims:
-            # Whole campaign is affected by prompt or cohort restructure
-            return max(1, total_leads)
+    def bundle_intents(intents: list[ProposalIntent], base_cfg: dict[str, Any]) -> ProposalIntent:
+        """Bundles multiple queued intents into a single atomic ProposalIntent.
 
-        # For welcome or voice or caller ID changes
+        Satisfies client supervisor request (Anita Desai, memo 04):
+        'If you have five things to change, send me one request with five things in it.'
+        """
+        if not intents:
+            raise ValueError("No intents to bundle")
+        if len(intents) == 1:
+            return intents[0]
+
+        merged_cfg = copy.deepcopy(base_cfg)
+        all_changed_dims = set()
+        rationales = []
+        max_impact = 0.0
+        evidence = None
+
+        for intent in intents:
+            all_changed_dims.update(intent.changed_dims)
+            if intent.rationale:
+                rationales.append(intent.rationale)
+            if intent.evidence:
+                evidence = intent.evidence  # keep latest evidence (e.g. validation_run_id)
+            if intent.impact_score > max_impact:
+                max_impact = intent.impact_score
+
+            # Deep merge proposed changes into base config
+            for k, v in intent.proposed_config.items():
+                if k == "allocations":
+                    if "allocations" not in merged_cfg:
+                        merged_cfg["allocations"] = {}
+                    for cohort, cohort_alloc in v.items():
+                        if cohort not in merged_cfg["allocations"]:
+                            merged_cfg["allocations"][cohort] = {}
+                        merged_cfg["allocations"][cohort].update(cohort_alloc)
+                else:
+                    merged_cfg[k] = copy.deepcopy(v)
+
+        return ProposalIntent(
+            workflow_id=intents[0].workflow_id,
+            proposed_config=merged_cfg,
+            rationale="; ".join(rationales),
+            changed_dims=list(all_changed_dims),
+            evidence=evidence,
+            change_summary=f"Bundled updates for {', '.join(all_changed_dims)}",
+            impact_score=max_impact,
+            created_minute=intents[-1].created_minute,
+        )
+
+    @staticmethod
+    def estimate_affected_leads(spec: dict[str, Any], changed_dims: list[str], total_leads: int) -> int:
+        """Estimates the number of leads affected by the change.
+
+        - For prompt or cohort changes, the entire campaign is affected.
+        - For individual variant distribution shifts, bounded by recent active campaign volume.
+        """
+        if "prompt_version" in changed_dims or "cohorts" in changed_dims:
+            return max(1, total_leads)
         daily_size = spec.get("daily_batch", {}).get("size", 1000)
         return max(1, min(total_leads, daily_size * 2))
 
@@ -164,7 +295,7 @@ class GovernanceEngine:
         changed_dims: list[str],
         recent_metrics: dict[str, Any],
     ) -> dict[str, Any]:
-        """Generates historical replay dry-run projections."""
+        """Generates historical replay dry-run projections to satisfy C10 and the approval API."""
         baseline_pickup = recent_metrics.get("pickup_rate", spec.get("base_pickup", 0.3))
         baseline_engage = recent_metrics.get("engagement_rate", spec.get("base_engage", 0.5))
 

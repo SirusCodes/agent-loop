@@ -42,7 +42,6 @@ class ControllerLoop:
             self.sim_ts = cp.sim_ts
             logger.info(f"Resumed from checkpoint: chunk={self.last_chunk_id}, event={self.last_event_id}, minute={self.sim_minute}")
 
-            # Reconcile pending proposals from DB
             pending_props = self.db.list_proposals(status="pending")
             for p in pending_props:
                 if p.approval_id and p.workflow_id in self.state_mgr.workflows:
@@ -92,7 +91,6 @@ class ControllerLoop:
                 prop.reasons = ap_info.get("reasons", [])
 
                 if status == "approved":
-                    # Check current version before applying
                     try:
                         cfg_now = self.client.get_config(wid)
                         wf.current_version = cfg_now["version"]
@@ -106,7 +104,6 @@ class ControllerLoop:
                             wf.pending_approvals.pop(aid, None)
                             continue
 
-                        # Apply approval
                         res = self.client.apply_approval(wid, aid)
                         applied_v = res.get("version", wf.current_version + 1)
                         prop.status = "applied"
@@ -131,14 +128,13 @@ class ControllerLoop:
                     wf.pending_approvals.pop(aid, None)
 
     def process_queued_proposals(self):
-        """Evaluate queued proposal intents for auto-apply or approval submission."""
+        """Evaluate queued proposal intents for auto-apply or scheduled dynamic window approval submission."""
         all_proposals = self.db.list_proposals()
 
         for wid, wf in self.state_mgr.workflows.items():
             if not wf.queued_intents:
                 continue
 
-            # Refresh config
             try:
                 cfg_info = self.client.get_config(wid)
                 wf.current_version = cfg_info["version"]
@@ -146,67 +142,72 @@ class ControllerLoop:
             except Exception as e:
                 logger.warning(f"Could not refresh config for {wid}: {e}")
 
-            # Pop next intent to process
-            intent = wf.queued_intents.pop(0)
+            # 1. Process auto-apply intents immediately (they don't fatigue human approvers)
+            remaining_intents = []
+            for intent in wf.queued_intents:
+                can_auto, auto_reason, changed_dims = GovernanceEngine.can_auto_apply(
+                    wf.spec, wf.current_config, intent.proposed_config
+                )
+                if can_auto:
+                    try:
+                        pid = f"auto_{int(time.time()*1000)}"
+                        res = self.client.auto_apply(
+                            wid,
+                            {
+                                "proposal_id": pid,
+                                "base_version": wf.current_version,
+                                "proposed_config": intent.proposed_config,
+                                "rationale": intent.rationale,
+                                "evidence": intent.evidence,
+                            },
+                        )
+                        applied_v = res.get("version", wf.current_version + 1)
+                        wf.current_version = applied_v
+                        wf.current_config = intent.proposed_config
 
-            # Check if auto-apply permitted
-            can_auto, auto_reason, changed_dims = GovernanceEngine.can_auto_apply(
-                wf.spec, wf.current_config, intent.proposed_config
-            )
+                        diff = compute_json_diff(wf.current_config, intent.proposed_config)
+                        prop_rec = ProposalRecord(
+                            proposal_id=pid,
+                            workflow_id=wid,
+                            base_version=wf.current_version - 1,
+                            status="applied",
+                            change_summary=intent.change_summary or f"Auto-apply {', '.join(changed_dims)}",
+                            proposed_config=intent.proposed_config,
+                            diff=diff,
+                            affected_leads=0,
+                            dry_run={"mode": "auto_apply"},
+                            impact_score=intent.impact_score,
+                            applied_version=applied_v,
+                            created_minute=self.sim_minute,
+                        )
+                        self.db.upsert_proposal(prop_rec)
+                        logger.info(f"[{self.sim_ts}] Auto-applied config for {wid} -> v{applied_v} ({changed_dims})")
+                    except Exception as e:
+                        logger.error(f"Auto-apply failed for {wid}: {e}. Retaining for approval.")
+                        remaining_intents.append(intent)
+                else:
+                    remaining_intents.append(intent)
 
-            if can_auto:
-                try:
-                    pid = f"auto_{int(time.time()*1000)}"
-                    res = self.client.auto_apply(
-                        wid,
-                        {
-                            "proposal_id": pid,
-                            "base_version": wf.current_version,
-                            "proposed_config": intent.proposed_config,
-                            "rationale": intent.rationale,
-                            "evidence": intent.evidence,
-                        },
-                    )
-                    applied_v = res.get("version", wf.current_version + 1)
-                    wf.current_version = applied_v
-                    wf.current_config = intent.proposed_config
+            wf.queued_intents = remaining_intents
+            if not wf.queued_intents:
+                continue
 
-                    # Record proposal as applied in DB
-                    diff = compute_json_diff(wf.current_config, intent.proposed_config)
-                    prop_rec = ProposalRecord(
-                        proposal_id=pid,
-                        workflow_id=wid,
-                        base_version=wf.current_version - 1,
-                        status="applied",
-                        change_summary=intent.change_summary or f"Auto-apply {', '.join(changed_dims)}",
-                        proposed_config=intent.proposed_config,
-                        diff=diff,
-                        affected_leads=0,
-                        dry_run={"mode": "auto_apply"},
-                        impact_score=intent.impact_score,
-                        applied_version=applied_v,
-                        created_minute=self.sim_minute,
-                    )
-                    self.db.upsert_proposal(prop_rec)
-                    logger.info(f"[{self.sim_ts}] Auto-applied config for {wid} -> v{applied_v} ({changed_dims})")
-                    continue
-                except Exception as e:
-                    logger.error(f"Auto-apply failed for {wid}: {e}. Falling back to approval queue.")
-
-            # Approval path: check approver working hours and quota
-            if not GovernanceEngine.is_approver_active(wf.spec, self.sim_minute):
-                logger.debug(f"[{self.sim_ts}] Approver for {wid} is outside working hours. Holding proposal in queue.")
-                wf.queued_intents.insert(0, intent)
+            # 2. For human approvals: check dynamic dispatch window and fatigue quota
+            is_emergency = any(intent.evidence is not None for intent in wf.queued_intents)
+            if not GovernanceEngine.is_dispatch_time(wf.spec, self.sim_minute, self.tick_step_minutes, is_emergency=is_emergency):
+                logger.debug(f"[{self.sim_ts}] Holding {len(wf.queued_intents)} intents for {wid} until scheduled dispatch slot.")
                 continue
 
             if not GovernanceEngine.is_quota_available(wid, wf.spec, all_proposals, self.sim_minute):
-                logger.info(f"[{self.sim_ts}] Approver 24h quota exceeded for {wid}. Batching/holding proposal in queue.")
-                wf.queued_intents.insert(0, intent)
+                logger.info(f"[{self.sim_ts}] Approver 24h quota reached for {wid}. Holding bundled changes in queue.")
                 continue
 
-            # Package proposal
+            # 3. Bundle all pending intents into a single atomic proposal payload
+            bundled_intent = GovernanceEngine.bundle_intents(wf.queued_intents, wf.current_config)
+            wf.queued_intents.clear()
+
             body = GovernanceEngine.package_proposal(
-                intent=intent,
+                intent=bundled_intent,
                 current_version=wf.current_version,
                 current_cfg=wf.current_config,
                 spec=wf.spec,
@@ -235,7 +236,7 @@ class ControllerLoop:
                 self.db.upsert_proposal(prop_rec)
                 if aid:
                     wf.pending_approvals[aid] = prop_rec
-                logger.info(f"[{self.sim_ts}] Submitted approval request {aid} for {wid}: {body['change_summary']}")
+                logger.info(f"[{self.sim_ts}] Dispatched bundled approval {aid} for {wid} at scheduled slot: {body['change_summary']}")
             except Exception as e:
                 logger.error(f"Failed to submit approval for {wid}: {e}")
 
@@ -250,12 +251,8 @@ class ControllerLoop:
         for ch in new_chunks:
             self._ingest_chunk(ch)
 
-        # 1. Reconcile existing approvals
         self.reconcile_approvals()
-
-        # 2. Process outgoing proposal queue
         self.process_queued_proposals()
-
         self.save_checkpoint()
         return not finished
 
