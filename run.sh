@@ -3,6 +3,10 @@
 set -euo pipefail
 
 SIM_URL="${1:?usage: ./run.sh <SIM_URL>}"
+DB_ARG=""
+if [ -n "${CONTROLLER_DB:-}" ]; then
+    DB_ARG="--db $CONTROLLER_DB"
+fi
 
 # Find python interpreter
 if [ -f "./.venv/bin/python3" ]; then
@@ -13,4 +17,4 @@ else
     PY="python"
 fi
 
-exec "$PY" -m controller.main --url "$SIM_URL"
+exec "$PY" -m controller.main --url "$SIM_URL" $DB_ARG
