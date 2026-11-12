@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .db import Database
+from .experiment import VariantTracker
 from .models import AuditEntry, ProposalIntent, ProposalRecord
 
 
@@ -45,6 +46,12 @@ class WorkflowRuntimeState:
         # Per DID stats: did -> [dials, connected]
         self.did_stats: dict[str, list[int]] = {}
 
+        # Variant experiment trackers: dim -> variant_value -> VariantTracker
+        self.variant_trackers: dict[str, dict[str, VariantTracker]] = {
+            "welcome_message": {},
+            "voice": {},
+        }
+
         # Pending proposals in flight: approval_id -> ProposalRecord
         self.pending_approvals: dict[str, ProposalRecord] = {}
 
@@ -67,6 +74,20 @@ class WorkflowRuntimeState:
             if connected:
                 self.did_stats[did][1] += 1
 
+        voice = variant.get("voice", "")
+        welcome = variant.get("welcome_message", "")
+
+        # Record for variant experimentation
+        if voice:
+            if voice not in self.variant_trackers["voice"]:
+                self.variant_trackers["voice"][voice] = VariantTracker("voice", voice)
+            self.variant_trackers["voice"][voice].record_call(connected, engaged)
+
+        if welcome:
+            if welcome not in self.variant_trackers["welcome_message"]:
+                self.variant_trackers["welcome_message"][welcome] = VariantTracker("welcome_message", welcome)
+            self.variant_trackers["welcome_message"][welcome].record_call(connected, engaged)
+
         if connected:
             self.total_connected += 1
         if engaged:
@@ -81,27 +102,17 @@ class WorkflowRuntimeState:
             engaged=engaged,
             hallucination_flag=hallucination,
             caller_id=did,
-            voice=variant.get("voice", ""),
-            welcome=variant.get("welcome_message", ""),
+            voice=voice,
+            welcome=welcome,
             prompt_version=variant.get("prompt_version", ""),
             cohort_id=ev.get("cohort_id", "default"),
         )
         self.recent_calls.append(outcome)
 
     def get_metrics_snapshot(self) -> dict[str, Any]:
-        pickup_rate = (
-            (self.total_connected / self.total_dials) if self.total_dials > 0 else 0.0
-        )
-        engage_rate = (
-            (self.total_engaged / self.total_connected)
-            if self.total_connected > 0
-            else 0.0
-        )
-        halluc_rate = (
-            (self.total_hallucinations / self.total_connected)
-            if self.total_connected > 0
-            else 0.0
-        )
+        pickup_rate = (self.total_connected / self.total_dials) if self.total_dials > 0 else 0.0
+        engage_rate = (self.total_engaged / self.total_connected) if self.total_connected > 0 else 0.0
+        halluc_rate = (self.total_hallucinations / self.total_connected) if self.total_connected > 0 else 0.0
 
         recent_dials = len(self.recent_calls)
         recent_conn = sum(1 for c in self.recent_calls if c.connected)
@@ -116,15 +127,9 @@ class WorkflowRuntimeState:
             "engagement_rate": round(engage_rate, 4),
             "hallucination_rate": round(halluc_rate, 4),
             "window_size": recent_dials,
-            "window_pickup_rate": (
-                round(recent_conn / recent_dials, 4) if recent_dials > 0 else 0.0
-            ),
-            "window_engagement_rate": (
-                round(recent_eng / recent_conn, 4) if recent_conn > 0 else 0.0
-            ),
-            "window_hallucination_rate": (
-                round(recent_halluc / recent_conn, 4) if recent_conn > 0 else 0.0
-            ),
+            "window_pickup_rate": round(recent_conn / recent_dials, 4) if recent_dials > 0 else 0.0,
+            "window_engagement_rate": round(recent_eng / recent_conn, 4) if recent_conn > 0 else 0.0,
+            "window_hallucination_rate": round(recent_halluc / recent_conn, 4) if recent_conn > 0 else 0.0,
         }
 
 
@@ -135,9 +140,7 @@ class StateManager:
         self.active_campaigns: dict[str, dict[str, Any]] = {}
         self.leads_count: dict[str, int] = {}  # workflow_id -> lead count
 
-    def register_workflow(
-        self, wid: str, spec: dict[str, Any], config_data: dict[str, Any]
-    ):
+    def register_workflow(self, wid: str, spec: dict[str, Any], config_data: dict[str, Any]):
         self.workflows[wid] = WorkflowRuntimeState(wid, spec, config_data)
 
     def process_event(self, ev: dict[str, Any], sim_minute: int):
@@ -149,9 +152,7 @@ class StateManager:
             if cid:
                 self.active_campaigns[cid] = ev
             if wid:
-                self.leads_count[wid] = self.leads_count.get(wid, 0) + ev.get(
-                    "leads", 0
-                )
+                self.leads_count[wid] = self.leads_count.get(wid, 0) + ev.get("leads", 0)
 
         elif ev_type == "call":
             if wid and wid in self.workflows:
@@ -171,9 +172,7 @@ class StateManager:
                 for aid, prop in list(wf.pending_approvals.items()):
                     if prop.base_version != new_v:
                         prop.status = "stale"
-                        prop.reasons.append(
-                            f"Supervisor updated config to version {new_v}"
-                        )
+                        prop.reasons.append(f"Supervisor updated config to version {new_v}")
                         self.db.upsert_proposal(prop)
                         wf.pending_approvals.pop(aid, None)
 
@@ -186,10 +185,7 @@ class StateManager:
                         actor=actor,
                         action="config_changed",
                         changed_dims=changed_dims,
-                        diff={
-                            "new_version": new_v,
-                            "proposal_id": ev.get("proposal_id"),
-                        },
+                        diff={"new_version": new_v, "proposal_id": ev.get("proposal_id")},
                         rationale=f"Config changed to version {new_v} by {actor}",
                         impact_score=0.0,
                         evidence={"approval_id": ev.get("approval_id")},
